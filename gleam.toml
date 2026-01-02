@@ -1,0 +1,16 @@
+name = "gtfs_gleam"
+version = "1.0.0"
+description = "A type-safe GTFS (General Transit Feed Specification) library for Gleam"
+licences = ["MIT"]
+repository = { type = "github", user = "evnsh", repo = "gtfs_gleam" }
+target = "erlang"
+
+[dependencies]
+gleam_stdlib = ">= 0.45.0 and < 2.0.0"
+simplifile = ">= 2.0.0 and < 3.0.0"
+filepath = ">= 1.0.0 and < 2.0.0"
+protobin = ">= 2.0.0 and < 3.0.0"
+
+
+[dev-dependencies]
+gleeunit = ">= 1.0.0 and < 2.0.0"

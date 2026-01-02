@@ -1,0 +1,23 @@
+#!/bin/bash
+# Pre-commit hook for gtfs_gleam
+# Install: ln -s ../../.githooks/pre-commit .git/hooks/pre-commit
+
+set -e
+
+echo "🔍 Running pre-commit checks..."
+
+# Check formatting
+echo "  Checking format..."
+if ! gleam format --check src test 2>/dev/null; then
+    echo "❌ Format check failed. Run 'gleam format src test' to fix."
+    exit 1
+fi
+
+# Run tests
+echo "  Running tests..."
+if ! gleam test 2>/dev/null; then
+    echo "❌ Tests failed."
+    exit 1
+fi
+
+echo "✅ All checks passed!"
