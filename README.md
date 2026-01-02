@@ -19,7 +19,7 @@ A comprehensive, type-safe GTFS (General Transit Feed Specification) library for
 ## Installation
 
 ```sh
-gleam add gtfs
+gleam add gtfs_gleam
 ```
 
 ## Quick Start
