@@ -30,6 +30,7 @@ import gleam/result
 import gleam/set
 import gleam/string
 import gtfs/internal/csv.{type ParseError}
+import gtfs/internal/profile
 import gtfs/internal/zip
 import gtfs/static/files/agency
 import gtfs/static/files/areas
@@ -217,9 +218,24 @@ pub fn load_with_options(
   path: String,
   options: LoadOptions,
 ) -> Result(Feed, LoadError) {
-  case string.ends_with(path, ".zip") {
-    True -> load_from_zip_with_options(path, options)
-    False -> load_from_directory_with_options(path, options)
+  case profile.enabled() {
+    True -> {
+      let start = profile.now_ms()
+
+      let result = case string.ends_with(path, ".zip") {
+        True -> load_from_zip_with_options(path, options)
+        False -> load_from_directory_with_options(path, options)
+      }
+
+      let finish = profile.now_ms()
+      profile.log("static.load.total", finish - start)
+      result
+    }
+    False ->
+      case string.ends_with(path, ".zip") {
+        True -> load_from_zip_with_options(path, options)
+        False -> load_from_directory_with_options(path, options)
+      }
   }
 }
 
@@ -233,24 +249,27 @@ pub fn load_from_zip_with_options(
   path: String,
   options: LoadOptions,
 ) -> Result(Feed, LoadError) {
-  // Read the ZIP file
   use zip_data <- result.try(
-    simplifile.read_bits(path)
-    |> result.map_error(fn(_) { FileError(path, "Failed to read ZIP file") }),
+    profile.time_result("static.zip.read_bits", fn() {
+      simplifile.read_bits(path)
+      |> result.map_error(fn(_) { FileError(path, "Failed to read ZIP file") })
+    }),
   )
 
-  // Open the ZIP archive
   use archive <- result.try(
-    zip.open(zip_data)
-    |> result.map_error(ZipError),
+    profile.time_result("static.zip.open", fn() {
+      zip.open(zip_data) |> result.map_error(ZipError)
+    }),
   )
 
-  // Load all files from archive
-  use feed <- result.try(load_from_archive_with_options(archive, options))
+  use feed <- result.try(
+    profile.time_result("static.zip.load_from_archive", fn() {
+      load_from_archive_with_options(archive, options)
+    }),
+  )
 
-  // Validate if requested
   case options.validate {
-    True -> validate_feed(feed)
+    True -> profile.time_result("static.validate", fn() { validate_feed(feed) })
     False -> Ok(feed)
   }
 }
@@ -535,11 +554,14 @@ pub fn load_from_directory_with_options(
   path: String,
   options: LoadOptions,
 ) -> Result(Feed, LoadError) {
-  use feed <- result.try(load_from_directory_internal(path))
+  use feed <- result.try(
+    profile.time_result("static.dir.load_files", fn() {
+      load_from_directory_internal(path)
+    }),
+  )
 
-  // Validate if requested
   case options.validate {
-    True -> validate_feed(feed)
+    True -> profile.time_result("static.validate", fn() { validate_feed(feed) })
     False -> Ok(feed)
   }
 }
@@ -662,7 +684,10 @@ fn load_from_directory_internal(path: String) -> Result(Feed, LoadError) {
 
 /// Validate a feed and return it if valid, or an error with all validation issues
 pub fn validate_feed(feed: Feed) -> Result(Feed, LoadError) {
-  let errors = collect_validation_errors(feed)
+  let errors =
+    profile.time("static.validate.collect_errors", fn() {
+      collect_validation_errors(feed)
+    })
 
   case errors {
     [] -> Ok(feed)
@@ -674,94 +699,135 @@ pub fn validate_feed(feed: Feed) -> Result(Feed, LoadError) {
 pub fn collect_validation_errors(feed: Feed) -> List(validation.ValidationError) {
   let errors: List(validation.ValidationError) = []
 
+  let profiling = profile.enabled()
+
+  let measure = fn(stage: String, thunk: fn() -> a) -> a {
+    case profiling {
+      True -> profile.time("static.validate." <> stage, thunk)
+      False -> thunk()
+    }
+  }
+
   // Check required files presence
   let file_errors =
-    validation.validate_required_files(
-      feed.agencies != [],
-      feed.stops != [],
-      feed.routes != [],
-      feed.trips != [],
-      feed.stop_times != [],
-      option.is_some(feed.calendar),
-      option.is_some(feed.calendar_dates),
-      option.is_some(feed.locations),
-    )
+    measure("required_files", fn() {
+      validation.validate_required_files(
+        feed.agencies != [],
+        feed.stops != [],
+        feed.routes != [],
+        feed.trips != [],
+        feed.stop_times != [],
+        option.is_some(feed.calendar),
+        option.is_some(feed.calendar_dates),
+        option.is_some(feed.locations),
+      )
+    })
   let errors = list.append(errors, file_errors)
 
   // Validate duplicates - these return tuples with (ids_set, errors)
   let #(_agency_ids, agency_errors) =
-    validation.validate_agency_ids(feed.agencies)
+    measure("dup_agency_ids", fn() {
+      validation.validate_agency_ids(feed.agencies)
+    })
   let errors = list.append(errors, agency_errors)
 
-  let #(stop_ids, stop_errors) = validation.validate_stop_ids(feed.stops)
+  let #(stop_ids, stop_errors) =
+    measure("dup_stop_ids", fn() { validation.validate_stop_ids(feed.stops) })
   let errors = list.append(errors, stop_errors)
 
-  let #(route_ids, route_errors) = validation.validate_route_ids(feed.routes)
+  let #(route_ids, route_errors) =
+    measure("dup_route_ids", fn() { validation.validate_route_ids(feed.routes) })
   let errors = list.append(errors, route_errors)
 
-  let #(trip_ids, trip_errors) = validation.validate_trip_ids(feed.trips)
+  let #(trip_ids, trip_errors) =
+    measure("dup_trip_ids", fn() { validation.validate_trip_ids(feed.trips) })
   let errors = list.append(errors, trip_errors)
 
   // Build agency_ids and service_ids for reference checking
   let agency_ids =
-    feed.agencies
-    |> list.filter_map(fn(a) { option.to_result(a.agency_id, Nil) })
-    |> set.from_list()
+    measure("build_agency_ids", fn() {
+      feed.agencies
+      |> list.filter_map(fn(a) { option.to_result(a.agency_id, Nil) })
+      |> set.from_list()
+    })
 
   // Get service IDs from calendar and calendar_dates
-  let service_ids = case feed.calendar {
-    Some(cal) -> {
-      cal
-      |> list.map(fn(c) { c.service_id })
-      |> set.from_list()
-    }
-    None -> set.new()
-  }
-  let service_ids = case feed.calendar_dates {
-    Some(dates) -> {
-      let date_service_ids =
-        dates
-        |> list.map(fn(d) { d.service_id })
-        |> set.from_list()
-      set.union(service_ids, date_service_ids)
-    }
-    None -> service_ids
-  }
+  let service_ids =
+    measure("build_service_ids", fn() {
+      let service_ids = case feed.calendar {
+        Some(cal) -> {
+          cal
+          |> list.map(fn(c) { c.service_id })
+          |> set.from_list()
+        }
+        None -> set.new()
+      }
+      case feed.calendar_dates {
+        Some(dates) -> {
+          let date_service_ids =
+            dates
+            |> list.map(fn(d) { d.service_id })
+            |> set.from_list()
+          set.union(service_ids, date_service_ids)
+        }
+        None -> service_ids
+      }
+    })
 
   // Validate foreign key references
   let single_agency = set.size(agency_ids) <= 1
   let route_agency_errors =
-    validation.validate_route_agency_refs(
-      feed.routes,
-      agency_ids,
-      single_agency,
-    )
+    measure("route_agency_refs", fn() {
+      validation.validate_route_agency_refs(
+        feed.routes,
+        agency_ids,
+        single_agency,
+      )
+    })
   let errors = list.append(errors, route_agency_errors)
 
   // Shape IDs if available
-  let shape_ids = case feed.shapes {
-    Some(shapes) -> {
-      shapes
-      |> list.map(fn(s) { s.shape_id })
-      |> set.from_list()
-    }
-    None -> set.new()
-  }
+  let shape_ids =
+    measure("build_shape_ids", fn() {
+      case feed.shapes {
+        Some(shapes) -> {
+          shapes
+          |> list.map(fn(s) { s.shape_id })
+          |> set.from_list()
+        }
+        None -> set.new()
+      }
+    })
 
   let trip_ref_errors =
-    validation.validate_trip_refs(feed.trips, route_ids, service_ids, shape_ids)
+    measure("trip_refs", fn() {
+      validation.validate_trip_refs(
+        feed.trips,
+        route_ids,
+        service_ids,
+        shape_ids,
+      )
+    })
   let errors = list.append(errors, trip_ref_errors)
 
   let stop_time_errors =
-    validation.validate_stop_time_refs(feed.stop_times, trip_ids, stop_ids)
+    measure("stop_time_refs", fn() {
+      validation.validate_stop_time_refs(feed.stop_times, trip_ids, stop_ids)
+    })
   let errors = list.append(errors, stop_time_errors)
 
   // Validate coordinates
-  let coord_errors = validation.validate_stop_coordinates(feed.stops)
+  let coord_errors =
+    measure("stop_coordinates", fn() {
+      validation.validate_stop_coordinates(feed.stops)
+    })
   let errors = list.append(errors, coord_errors)
 
   // Validate stop time sequences
-  let sequence_errors = validation.validate_stop_time_sequences(feed.stop_times)
+  let sequence_errors =
+    measure("stop_time_sequences", fn() {
+      validation.validate_stop_time_sequences(feed.stop_times)
+    })
   let errors = list.append(errors, sequence_errors)
 
   errors
@@ -815,15 +881,17 @@ fn load_file(
 ) -> Result(a, LoadError) {
   let filepath = dir <> "/" <> filename
 
-  case simplifile.read(filepath) {
-    Ok(content) -> {
-      case parser(content) {
-        Ok(data) -> Ok(data)
-        Error(parse_error) -> Error(CsvParseError(filename, parse_error))
+  profile.time_result("static.file." <> filename, fn() {
+    case simplifile.read(filepath) {
+      Ok(content) -> {
+        case parser(content) {
+          Ok(data) -> Ok(data)
+          Error(parse_error) -> Error(CsvParseError(filename, parse_error))
+        }
       }
+      Error(_) -> Error(MissingRequiredFile(filename))
     }
-    Error(_) -> Error(MissingRequiredFile(filename))
-  }
+  })
 }
 
 fn load_optional_file(
@@ -833,15 +901,17 @@ fn load_optional_file(
 ) -> Option(a) {
   let filepath = dir <> "/" <> filename
 
-  case simplifile.read(filepath) {
-    Ok(content) -> {
-      case parser(content) {
-        Ok(data) -> Some(data)
-        Error(_) -> None
+  profile.time("static.file." <> filename, fn() {
+    case simplifile.read(filepath) {
+      Ok(content) -> {
+        case parser(content) {
+          Ok(data) -> Some(data)
+          Error(_) -> None
+        }
       }
+      Error(_) -> None
     }
-    Error(_) -> None
-  }
+  })
 }
 
 fn load_optional_file_single(
@@ -851,29 +921,33 @@ fn load_optional_file_single(
 ) -> Option(a) {
   let filepath = dir <> "/" <> filename
 
-  case simplifile.read(filepath) {
-    Ok(content) -> {
-      case parser(content) {
-        Ok(data) -> data
-        Error(_) -> None
+  profile.time("static.file." <> filename, fn() {
+    case simplifile.read(filepath) {
+      Ok(content) -> {
+        case parser(content) {
+          Ok(data) -> data
+          Error(_) -> None
+        }
       }
+      Error(_) -> None
     }
-    Error(_) -> None
-  }
+  })
 }
 
 fn load_geojson_file(dir: String, filename: String) -> Option(LocationsGeoJson) {
   let filepath = dir <> "/" <> filename
 
-  case simplifile.read(filepath) {
-    Ok(content) -> {
-      case locations_geojson.parse(content) {
-        Ok(data) -> Some(data)
-        Error(_) -> None
+  profile.time("static.file." <> filename, fn() {
+    case simplifile.read(filepath) {
+      Ok(content) -> {
+        case locations_geojson.parse(content) {
+          Ok(data) -> Some(data)
+          Error(_) -> None
+        }
       }
+      Error(_) -> None
     }
-    Error(_) -> None
-  }
+  })
 }
 
 // =============================================================================
@@ -885,15 +959,17 @@ fn load_zip_file(
   filename: String,
   parser: fn(String) -> Result(a, ParseError),
 ) -> Result(a, LoadError) {
-  case zip.extract_string(archive, filename) {
-    Ok(content) -> {
-      case parser(content) {
-        Ok(data) -> Ok(data)
-        Error(parse_error) -> Error(CsvParseError(filename, parse_error))
+  profile.time_result("static.zip." <> filename, fn() {
+    case zip.extract_string(archive, filename) {
+      Ok(content) -> {
+        case parser(content) {
+          Ok(data) -> Ok(data)
+          Error(parse_error) -> Error(CsvParseError(filename, parse_error))
+        }
       }
+      Error(_) -> Error(MissingRequiredFile(filename))
     }
-    Error(_) -> Error(MissingRequiredFile(filename))
-  }
+  })
 }
 
 fn load_zip_optional(
@@ -901,15 +977,17 @@ fn load_zip_optional(
   filename: String,
   parser: fn(String) -> Result(a, ParseError),
 ) -> Option(a) {
-  case zip.extract_string(archive, filename) {
-    Ok(content) -> {
-      case parser(content) {
-        Ok(data) -> Some(data)
-        Error(_) -> None
+  profile.time("static.zip." <> filename, fn() {
+    case zip.extract_string(archive, filename) {
+      Ok(content) -> {
+        case parser(content) {
+          Ok(data) -> Some(data)
+          Error(_) -> None
+        }
       }
+      Error(_) -> None
     }
-    Error(_) -> None
-  }
+  })
 }
 
 fn load_zip_optional_single(
@@ -917,30 +995,34 @@ fn load_zip_optional_single(
   filename: String,
   parser: fn(String) -> Result(Option(a), ParseError),
 ) -> Option(a) {
-  case zip.extract_string(archive, filename) {
-    Ok(content) -> {
-      case parser(content) {
-        Ok(data) -> data
-        Error(_) -> None
+  profile.time("static.zip." <> filename, fn() {
+    case zip.extract_string(archive, filename) {
+      Ok(content) -> {
+        case parser(content) {
+          Ok(data) -> data
+          Error(_) -> None
+        }
       }
+      Error(_) -> None
     }
-    Error(_) -> None
-  }
+  })
 }
 
 fn load_zip_geojson(
   archive: zip.ZipArchive,
   filename: String,
 ) -> Option(LocationsGeoJson) {
-  case zip.extract_string(archive, filename) {
-    Ok(content) -> {
-      case locations_geojson.parse(content) {
-        Ok(data) -> Some(data)
-        Error(_) -> None
+  profile.time("static.zip." <> filename, fn() {
+    case zip.extract_string(archive, filename) {
+      Ok(content) -> {
+        case locations_geojson.parse(content) {
+          Ok(data) -> Some(data)
+          Error(_) -> None
+        }
       }
+      Error(_) -> None
     }
-    Error(_) -> None
-  }
+  })
 }
 
 // =============================================================================
