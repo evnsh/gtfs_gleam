@@ -14,7 +14,9 @@ import gleam/float
 import gleam/int
 import gleam/list
 import gleam/option.{type Option, None, Some}
+import gleam/result
 import gleam/string
+import gsv
 
 // =============================================================================
 // Types
@@ -49,22 +51,18 @@ pub type ParseError {
 /// Parse CSV content following RFC 4180 rules
 /// Returns a list of rows, each as a dictionary mapping field names to values
 pub fn parse(content: String) -> Result(List(CsvRow), ParseError) {
-  // Remove BOM if present
   let content = strip_bom(content)
-
-  // Normalize line endings to LF
   let content = string.replace(content, "\r\n", "\n")
   let content = string.replace(content, "\r", "\n")
 
-  // Parse into lines handling quoted fields with embedded newlines
-  case parse_lines(content) {
-    [] -> Error(EmptyFile)
-    [header_line, ..data_lines] -> {
-      let headers = parse_fields(header_line)
+  use rows <- result.try(
+    gsv.to_lists(content, separator: ",")
+    |> result.map_error(gsv_error_to_parse_error),
+  )
 
-      // Parse each data line and create row dictionaries
-      parse_data_lines(data_lines, headers, 2, [])
-    }
+  case rows {
+    [] -> Error(EmptyFile)
+    [headers, ..data_rows] -> parse_data_rows(data_rows, headers, 2, [])
   }
 }
 
@@ -75,9 +73,14 @@ pub fn parse_raw(content: String) -> Result(List(List(String)), ParseError) {
   let content = string.replace(content, "\r\n", "\n")
   let content = string.replace(content, "\r", "\n")
 
-  case parse_lines(content) {
+  use rows <- result.try(
+    gsv.to_lists(content, separator: ",")
+    |> result.map_error(gsv_error_to_parse_error),
+  )
+
+  case rows {
     [] -> Error(EmptyFile)
-    lines -> Ok(list.map(lines, parse_fields))
+    rows -> Ok(rows)
   }
 }
 
@@ -185,109 +188,33 @@ fn strip_bom(content: String) -> String {
   }
 }
 
-/// Parse content into logical lines, handling quoted fields with embedded newlines
-fn parse_lines(content: String) -> List(String) {
-  parse_lines_impl(content, "", False, [])
-}
+fn gsv_error_to_parse_error(error: gsv.Error) -> ParseError {
+  case error {
+    gsv.UnescapedQuote(line) ->
+      QuotingError(row: line, reason: "Unescaped quote")
 
-fn parse_lines_impl(
-  content: String,
-  current_line: String,
-  in_quotes: Bool,
-  acc: List(String),
-) -> List(String) {
-  case content {
-    "" -> {
-      // End of content
-      case current_line {
-        "" -> list.reverse(acc)
-        line -> list.reverse([line, ..acc])
-      }
-    }
-    "\"" <> rest -> {
-      // Toggle quote state (simplified - doesn't handle escaped quotes in this check)
-      parse_lines_impl(rest, current_line <> "\"", !in_quotes, acc)
-    }
-    "\n" <> rest -> {
-      case in_quotes {
-        True ->
-          // Newline inside quoted field - keep it
-          parse_lines_impl(rest, current_line <> "\n", in_quotes, acc)
-        False -> {
-          // End of line
-          case current_line {
-            "" -> parse_lines_impl(rest, "", False, acc)
-            line -> parse_lines_impl(rest, "", False, [line, ..acc])
-          }
-        }
-      }
-    }
-    _ -> {
-      case string.pop_grapheme(content) {
-        Ok(#(char, rest)) ->
-          parse_lines_impl(rest, current_line <> char, in_quotes, acc)
-        Error(_) -> list.reverse(acc)
-      }
-    }
+    gsv.MissingClosingQuote(starting_line) ->
+      QuotingError(row: starting_line, reason: "Missing closing quote")
   }
 }
 
-/// Parse a line into fields, handling quoted values
-fn parse_fields(line: String) -> List(String) {
-  parse_fields_impl(line, "", False, [])
-}
-
-fn parse_fields_impl(
-  content: String,
-  current_field: String,
-  in_quotes: Bool,
-  acc: List(String),
-) -> List(String) {
-  case content {
-    "" -> {
-      // End of line - add current field
-      list.reverse([current_field, ..acc])
-    }
-    "\"\"" <> rest if in_quotes -> {
-      // Escaped quote inside quoted field
-      parse_fields_impl(rest, current_field <> "\"", True, acc)
-    }
-    "\"" <> rest -> {
-      // Toggle quote state
-      parse_fields_impl(rest, current_field, !in_quotes, acc)
-    }
-    "," <> rest if !in_quotes -> {
-      // Field separator (not inside quotes)
-      parse_fields_impl(rest, "", False, [current_field, ..acc])
-    }
-    _ -> {
-      case string.pop_grapheme(content) {
-        Ok(#(char, rest)) ->
-          parse_fields_impl(rest, current_field <> char, in_quotes, acc)
-        Error(_) -> list.reverse([current_field, ..acc])
-      }
-    }
-  }
-}
-
-/// Parse data lines into row dictionaries
-fn parse_data_lines(
-  lines: List(String),
+/// Parse data rows into row dictionaries
+fn parse_data_rows(
+  rows: List(List(String)),
   headers: List(String),
   row_num: Int,
   acc: List(CsvRow),
 ) -> Result(List(CsvRow), ParseError) {
-  case lines {
+  case rows {
     [] -> Ok(list.reverse(acc))
-    [line, ..rest] -> {
-      let fields = parse_fields(line)
+    [fields, ..rest] -> {
       let header_count = list.length(headers)
       let field_count = list.length(fields)
 
       case field_count == header_count {
         True -> {
           let row = create_row(headers, fields, dict.new())
-          parse_data_lines(rest, headers, row_num + 1, [row, ..acc])
+          parse_data_rows(rest, headers, row_num + 1, [row, ..acc])
         }
         False -> {
           Error(FieldCountMismatch(
