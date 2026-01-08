@@ -4,6 +4,7 @@
 //// Implements decoders for all message types defined in gtfs-realtime.proto.
 
 import gleam/dynamic/decode
+import gleam/list
 import gleam/option.{type Option, None, Some}
 import gtfs/realtime/types.{
   type Alert, type AlertCause, type AlertEffect, type CarriageDetails,
@@ -20,6 +21,36 @@ import gtfs/realtime/types.{
   type VehiclePosition, type VehicleStopStatus, type WheelchairAccessible,
 }
 import protobin
+
+fn decode_single_or_list_bit_array() -> decode.Decoder(BitArray) {
+  decode.one_of(decode.bit_array, or: [
+    {
+      use values <- decode.then(decode.list(of: decode.bit_array))
+      case list.last(values) {
+        Ok(value) -> decode.success(value)
+        Error(Nil) -> decode.failure(<<>>, "BitArray")
+      }
+    },
+  ])
+}
+
+fn decode_float32() -> decode.Decoder(Float) {
+  use bits <- decode.then(decode_single_or_list_bit_array())
+
+  case bits {
+    <<num:float-little-size(32)>> -> decode.success(num)
+    _ -> decode.failure(0.0, "Float32")
+  }
+}
+
+fn decode_float64() -> decode.Decoder(Float) {
+  use bits <- decode.then(decode_single_or_list_bit_array())
+
+  case bits {
+    <<num:float-little-size(64)>> -> decode.success(num)
+    _ -> decode.failure(0.0, "Float64")
+  }
+}
 
 // =============================================================================
 // Feed Message Decoder
@@ -611,35 +642,31 @@ fn position_decoder() -> decode.Decoder(Position) {
   use latitude <- decode.optional_field(
     1,
     None,
-    decode.optional(protobin.decode_uint()),
+    decode.optional(decode_float32()),
   )
   use longitude <- decode.optional_field(
     2,
     None,
-    decode.optional(protobin.decode_uint()),
+    decode.optional(decode_float32()),
   )
   use bearing <- decode.optional_field(
     3,
     None,
-    decode.optional(protobin.decode_uint()),
+    decode.optional(decode_float32()),
   )
   use odometer <- decode.optional_field(
     4,
     None,
-    decode.optional(protobin.decode_uint()),
+    decode.optional(decode_float64()),
   )
-  use speed <- decode.optional_field(
-    5,
-    None,
-    decode.optional(protobin.decode_uint()),
-  )
+  use speed <- decode.optional_field(5, None, decode.optional(decode_float32()))
 
   decode.success(types.Position(
-    latitude: int_to_float(option_unwrap(latitude, 0)),
-    longitude: int_to_float(option_unwrap(longitude, 0)),
-    bearing: option_map(bearing, int_to_float),
-    odometer: option_map(odometer, int_to_float),
-    speed: option_map(speed, int_to_float),
+    latitude: option_unwrap(latitude, 0.0),
+    longitude: option_unwrap(longitude, 0.0),
+    bearing: bearing,
+    odometer: odometer,
+    speed: speed,
   ))
 }
 
@@ -1275,12 +1302,12 @@ fn realtime_stop_decoder() -> decode.Decoder(RealtimeStop) {
   use stop_lat <- decode.optional_field(
     6,
     None,
-    decode.optional(protobin.decode_uint()),
+    decode.optional(decode_float32()),
   )
   use stop_lon <- decode.optional_field(
     7,
     None,
-    decode.optional(protobin.decode_uint()),
+    decode.optional(decode_float32()),
   )
   use zone_id <- decode.optional_field(
     8,
@@ -1332,8 +1359,8 @@ fn realtime_stop_decoder() -> decode.Decoder(RealtimeStop) {
     stop_name: stop_name,
     tts_stop_name: tts_stop_name,
     stop_desc: stop_desc,
-    stop_lat: option_map(stop_lat, int_to_float),
-    stop_lon: option_map(stop_lon, int_to_float),
+    stop_lat: stop_lat,
+    stop_lon: stop_lon,
     zone_id: zone_id,
     stop_url: stop_url,
     parent_station: parent_station,
@@ -1696,6 +1723,3 @@ fn result_map(result: Result(a, e), f: fn(a) -> b) -> Result(b, e) {
     Error(e) -> Error(e)
   }
 }
-
-@external(erlang, "erlang", "float")
-fn int_to_float(i: Int) -> Float
