@@ -1,5 +1,5 @@
 name = "gtfs_gleam"
-version = "1.0.0"
+version = "1.0.1"
 description = "A type-safe GTFS (General Transit Feed Specification) library for Gleam"
 licences = ["MIT"]
 repository = { type = "github", user = "evnsh", repo = "gtfs_gleam" }

@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.1] - 2026-01-08
+
+### Fixed
+
+- Correctly decode GTFS Realtime float fields when using protobin.
+
+### Added
+
+- Opt-in profiling for GTFS Static feed loading and validation (set `GTFS_GLEAM_PROFILE=1`).
+
+### Changed
+
+- Use `gsv` as the backing CSV parser for GTFS Static files.
+
 ## [1.0.0] - 2026-01-02
 
 ### Added
